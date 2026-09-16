@@ -1,4 +1,5 @@
-"""THis script trains a 3D CNN to predict a subject's age from their T1w MRI volume."""
+"""THis script trains a 3D CNN to predict a subject's age from their T1w MRI volume.
+USING simple CNN ARCHITECTURE (3 BLOCKS, GLOBAL AVERAGE POOLING, SINGLE SCALAR OUTPUT)."""
 
 #IMPORTS
 from datetime import datetime
@@ -20,7 +21,7 @@ AGE_COLUMN = "AgeMRI_W1"
 
 # Downsampled from the native (256, 256, 160) so a batch fits in memory on a
 # laptop: 5 stride-2 pools in BrainAgeCNN need dims divisible by 32 anyway.
-TARGET_SHAPE = (128, 128, 96)
+TARGET_SHAPE = (64, 64, 24)
 
 BATCH_SIZE = 4
 NUM_EPOCHS = 30
@@ -109,19 +110,14 @@ class MRIAgeDataset(Dataset):
 
 
 class BrainAgeCNN(nn.Module):
-    """Lightweight 3D CNN for age regression from a T1w volume (SFCN-style).
-
-    Each block halves every spatial dimension, so 5 blocks need input dims
-    divisible by 32 (see TARGET_SHAPE). Global average pooling before the
-    final linear layer keeps the parameter count small and avoids overfitting
-    on a few hundred training subjects like we have here. The final output is a single scalar (predicted age). 
-    Groupnorm is used instead of BatchNorm3d because with a batch size of 4 the per-batch statistics BatchNorm relies on are too noisy and destabilize training;
-    GroupNorm normalizes within each sample instead, so it's unaffected by batch size. 
+    """3D CNN for predicting age from a T1w MRI volume.
+    3 blocks of Conv3d + GroupNorm + ReLU + MaxPool3d
+    Global average pooling before the final linear layer keeps the parameter count small and avoids overfitting
     """
 
     def __init__(self, in_channels: int = 1):
         super().__init__()
-        block_channels = [32, 64, 128, 256, 256]
+        block_channels =[16, 32, 64]
 
         blocks = []
         prev_channels = in_channels
@@ -137,13 +133,16 @@ class BrainAgeCNN(nn.Module):
             prev_channels = out_channels
 
         self.features = nn.Sequential(*blocks)
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.dropout = nn.Dropout(0.4)
-        self.regressor = nn.Linear(block_channels[-1], 1)
+        self.flatten = nn.Flatten()
+        self.dropout = nn.Dropout(0.25)
+        # 3 pools halve each spatial dim 3x: (64,64,24) -> (8,8,3), times 64 channels.
+        # Unlike AdaptiveAvgPool3d(1), this size is fixed to TARGET_SHAPE and must be
+        # recomputed by hand if TARGET_SHAPE or the number of blocks changes.
+        self.regressor = nn.Linear(block_channels[-1] * 8 * 8 * 3, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = self.pool(x).flatten(1)
+        x = self.flatten(x)
         x = self.dropout(x)
         return self.regressor(x).squeeze(1)
 
