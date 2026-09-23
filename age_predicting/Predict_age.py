@@ -248,7 +248,7 @@ if __name__ == "__main__":
 
     # Timestamping the filename avoids overwriting a previous checkpoint if the script is re-run.
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_PATH = CHECKPOINT_DIR / f"brain_age_cnn_{datetime.now():%Y%m%d_%H%M%S}.pt"
+    CHECKPOINT_PATH = CHECKPOINT_DIR / f"brain_age_cnn_5block{datetime.now():%Y%m%d_%H%M%S}.pt"
     best_val_mae = float("inf")
     best_epoch = 0
 

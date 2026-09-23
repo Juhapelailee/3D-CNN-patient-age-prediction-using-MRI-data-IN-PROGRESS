@@ -1,5 +1,5 @@
 """THis script trains a 3D CNN to predict a subject's age from their T1w MRI volume.
-USING simple CNN ARCHITECTURE (3 BLOCKS, GLOBAL AVERAGE POOLING, SINGLE SCALAR OUTPUT)."""
+USING MODIFIED RESNET ARCHITECTURE."""
 
 #IMPORTS
 from datetime import datetime
@@ -21,7 +21,7 @@ AGE_COLUMN = "AgeMRI_W1"
 
 # Downsampled from the native (256, 256, 160) so a batch fits in memory on a
 # laptop: 5 stride-2 pools in BrainAgeCNN need dims divisible by 32 anyway.
-TARGET_SHAPE = (64, 64, 24)
+TARGET_SHAPE = (128, 128, 96)
 
 BATCH_SIZE = 4
 NUM_EPOCHS = 30
@@ -109,40 +109,67 @@ class MRIAgeDataset(Dataset):
         return tensor, age
 
 
-class BrainAgeCNN(nn.Module):
-    """3D CNN for predicting age from a T1w MRI volume.
-    3 blocks of Conv3d + GroupNorm + ReLU + MaxPool3d
-    Global average pooling before the final linear layer keeps the parameter count small and avoids overfitting
+class ResidualBlock3D(nn.Module):
+    """One residual block: Conv-BN-ReLU-Conv-BN, added to a projected shortcut, then ReLU.
+
+    conv1 does the downsampling (stride=2) instead of a separate MaxPool3d. The
+    1x1x1 shortcut conv is used unconditionally here (not just nn.Identity())
+    because every block in BrainAgeResNet changes both channel count and spatial
+    size, so the shortcut always needs its own projection to match shapes before
+    the addition.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 2):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
+        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.shortcut = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride),
+            nn.GroupNorm(num_groups=8, num_channels=out_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        return self.relu(out + identity)
+
+
+class BrainAgeResNet(nn.Module):
+    """3D ResNet-style CNN for age regression from a T1w volume.
+
+    One ResidualBlock3D per resolution stage (5 stages, see block_channels) in
+    place of BrainAgeCNN's plain Conv-Norm-ReLU-Pool blocks — each block's
+    shortcut lets the loss's gradient skip past its two convolutions, which is
+    what "residual" learning refers to. Uses GroupNorm rather than BatchNorm3d:
+    a BatchNorm3d version of this model was tried first and showed much larger
+    val MAE swings epoch to epoch than every GroupNorm-based model here, which
+    tracks with BatchNorm's running statistics being noisy at batch size 4.
+    Global average pooling before the final linear layer keeps the head itself
+    small and independent of input resolution, same as the original ResNet head.
     """
 
     def __init__(self, in_channels: int = 1):
         super().__init__()
-        block_channels =[16, 32, 64]
+        block_channels = [32, 64, 128, 256, 256]
 
         blocks = []
         prev_channels = in_channels
         for out_channels in block_channels:
-            blocks.append(
-                nn.Sequential(
-                    nn.Conv3d(prev_channels, out_channels, kernel_size=3, padding=1),
-                    nn.GroupNorm(num_groups=8, num_channels=out_channels),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool3d(2),
-                )
-            )
+            blocks.append(ResidualBlock3D(prev_channels, out_channels, stride=2))
             prev_channels = out_channels
 
         self.features = nn.Sequential(*blocks)
-        self.flatten = nn.Flatten()
-        self.dropout = nn.Dropout(0.25)
-        # 3 pools halve each spatial dim 3x: (64,64,24) -> (8,8,3), times 64 channels.
-        # Unlike AdaptiveAvgPool3d(1), this size is fixed to TARGET_SHAPE and must be
-        # recomputed by hand if TARGET_SHAPE or the number of blocks changes.
-        self.regressor = nn.Linear(block_channels[-1] * 8 * 8 * 3, 1)
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.dropout = nn.Dropout(0.4)
+        self.regressor = nn.Linear(block_channels[-1], 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = self.flatten(x)
+        x = self.pool(x).flatten(1)
         x = self.dropout(x)
         return self.regressor(x).squeeze(1)
 
@@ -220,7 +247,7 @@ if __name__ == "__main__":
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    model = BrainAgeCNN().to(device)
+    model = BrainAgeResNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -244,7 +271,7 @@ if __name__ == "__main__":
 
     # Timestamping the filename avoids overwriting a previous checkpoint if the script is re-run.
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_PATH = CHECKPOINT_DIR / f"brain_age_cnn_simple{datetime.now():%Y%m%d_%H%M%S}.pt"
+    CHECKPOINT_PATH = CHECKPOINT_DIR / f"brain_age_resnet_{datetime.now():%Y%m%d_%H%M%S}.pt"
     best_val_mae = float("inf")
     best_epoch = 0
 
